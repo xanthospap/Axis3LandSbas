@@ -1,0 +1,8 @@
+docker --version
+Enable and start the Docker service
+sudo systemctl enable docker
+sudo systemctl start docker
+sudo systemctl status docker
+sudo docker run --rm hello-world
+sudo groupadd docker 2>/dev/null || true
+sudo usermod -aG docker "xanthos"

@@ -1,0 +1,42 @@
+project_name: SBAS_SAT4GAIA
+working_dir: ./
+steps:
+  step1_download_sentinel: true
+  step2_download_orbits: true
+  step3_dem_creation: true
+  step4_stack_interferograms: true
+  step5_run_stack: true
+  step6_run_mintpy: true
+sentinel:
+  aoi: "24.07,35.37,24.22,35.27"
+  orbit: "DESCENDING"
+  start_date: "20250101"
+  end_date: "20250301"
+  path: ""
+  frame_id: ""
+  username: "vtsironi"
+  password: "VarvaraTsi1993!"
+dem:
+  bbox: "34 36 23 27"
+  output_dir: "DEM"
+stack:
+  bbox: [34.56, 35.89, 23.0, 26.68]
+  reference_date: "20250112"
+  aux_cal_path: "/home/sbas/aux_cal"
+  config: null
+mintpy:
+  reference_lalo: [35.5, 24.02]
+logging:
+  log_dir: "logs"
+  log_level: "INFO"
+environment:
+  isce2_env: "base"
+  mintpy_env: "base"
+  topsStack_dir: "/opt/conda/share/isce2/topsStack"
+  isce_stack_dir: "/opt/conda/share/isce2"
+  conda_python_path: "/opt/conda/bin/python"
+  conda_env_path: "/opt/conda/bin"
+runtime:
+  resume: false
+  dry_run: false
+  start_from_step: null

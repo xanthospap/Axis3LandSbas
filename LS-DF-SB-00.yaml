@@ -1,0 +1,4 @@
+spatial_extent: ["23.0", "34.5", "26.7", "36.0"]  # strings, not bare numbers
+start_date: "20250101"
+end_date:   "20250210"
+thematic_service_name: "LAND"
