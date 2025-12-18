@@ -6,7 +6,7 @@ import json
 import os
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence, Tuple, Union, List
 import numpy as np
@@ -16,6 +16,7 @@ import rasterio
 
 try:
     from osgeo import gdal, osr
+
     gdal.UseExceptions()  # clearer errors; avoids future warning about exceptions
 except Exception:
     gdal = None
@@ -95,19 +96,59 @@ COLLECTIONS = {
     },
 }
 
+# ---- STAC extensions: projection, raster, processing ----
+PROJ_EXT = "https://stac-extensions.github.io/projection/v1.0.0/schema.json"
+RASTER_EXT = "https://stac-extensions.github.io/raster/v1.1.0/schema.json"
+PROCESSING_EXT = "https://stac-extensions.github.io/processing/v1.2.0/schema.json"
+# Axis-3 processing metadata
+PROCESSING_FACILITY = "AXIS-3 LAND"
+PROCESSING_LEVEL = "L3"
+PROCESSING_VERSION = "1.1.0"
+PROCESSING_SHORT_VERSION = "1.1"
+PROCESSING_SOFTWARE_NAME = "Axis3LandSbas"
+PROCESSING_SOFTWARE_REPO = "https://github.com/HellenicSpaceCenter/Axis3LandSbas"
+
+
+# Asset title as
+# <Product Label> – <AOI> – <Logical Layer> – <Temporal Baseline>
+# "SBAS (Distributed Scatterers) displacement maps for Greece – Greece – Line-of-sight displacement velocity – 2025-12-16T07:35:09Z",
+def GEO_VELOCITY_TITLE(t=datetime.now(timezone.utc)):
+    return f"SBAS displacement maps for Greece - Greece - LOS displacement velocity - {t.isoformat()}"
+
+
+def parse_hub_ts(ts: str) -> datetime:
+    """
+    Parse 'YYYYMMDDTHHMMSSdmmm' to UTC datetime.
+    Example: '20251217T144338d086' -> 2025-12-17 14:43:38.086000+00:00
+    """
+    ts = ts.strip()
+    if len(ts) != 19 or ts[15] != "d":
+        raise ValueError(f"Not a valid Hub timestamp: {ts!r}")
+
+    base = ts[:15]  # 'YYYYMMDDTHHMMSS'
+    ms_str = ts[16:]  # 'mmm'
+
+    dt = datetime.strptime(base, "%Y%m%dT%H%M%S")
+    ms = int(ms_str)
+    return dt.replace(microsecond=ms * 1000, tzinfo=timezone.utc)
+
+
 # --- STAC Item ID validation for LS-DF per PDF spec ---
 
 # Ad-hoc / On-demand:
 # <Service_UID>_<YYYYMMDDTHHMMSSmmm>_<NNNNNN>
-_ADHOC_RE = re.compile(
-    r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}\d{3})_(?P<ctr>\d{6})$"
-)
+# _ADHOC_RE = re.compile(
+#    r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}d\d{3})_(?P<ctr>\d{6})$"
+# )
+_ADHOC_RE = re.compile(r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}d\d{3})$")
+# _ADHOC_RE = re.compile(
+#    r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}\d{3})(?:_(?P<ctr>\d{6}))?$"
+# )
 
 # Systematic (day-level example):
 # <Service_UID>_<YYYYMMDD>
-_SYSTEMATIC_DAY_RE = re.compile(
-    r"^(?P<svc>[A-Z0-9\-]+)_(?P<date>\d{8})$"
-)
+_SYSTEMATIC_DAY_RE = re.compile(r"^(?P<svc>[A-Z0-9\-]+)_(?P<date>\d{8})$")
+
 
 def _id_ok_for_ls_df(item_id: str) -> bool:
     """
@@ -127,6 +168,19 @@ def _id_ok_for_ls_df(item_id: str) -> bool:
     return False
 
 
+def _item_uid_from_id(item_id: str) -> str:
+    """
+    Derive Item_UID (= <ServiceUID>_<YYYYMMDDTHHMMSSmmm>)
+    from an LS-DF ad-hoc item id:
+        <ServiceUID>_<YYYYMMDDTHHMMSSmmm>_<NNNNNN>
+    If it doesn't match, just return the full id.
+    """
+    m = _ADHOC_RE.match(item_id)
+    if m:
+        return f"{m.group('svc')}_{m.group('ts')}"
+    return item_id
+
+
 def _is_cog(path: Path) -> bool:
     """Return True if the file is a Cloud Optimized GeoTIFF."""
     if gdal is None:
@@ -141,7 +195,11 @@ def _is_cog(path: Path) -> bool:
 def _is_subdataset_string(s: str) -> bool:
     """Detect GDAL subdataset strings like HDF5:\"file.h5\"://name or NETCDF:\"file.nc\"://var."""
     s = str(s)
-    return (('HDF5:"' in s or 'NETCDF:"' in s) and '"://' in s) or s.startswith("HDF5:") or s.startswith("NETCDF:")
+    return (
+        (('HDF5:"' in s or 'NETCDF:"' in s) and '"://' in s)
+        or s.startswith("HDF5:")
+        or s.startswith("NETCDF:")
+    )
 
 
 def _safe_name_from_sds(s: str) -> str:
@@ -151,7 +209,7 @@ def _safe_name_from_sds(s: str) -> str:
         stem = s.split('"://', 1)[-1]
     else:
         stem = s
-    stem = re.sub(r'[^A-Za-z0-9._-]+', '_', stem).strip('_')
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("_")
     return stem or "asset"
 
 
@@ -166,10 +224,12 @@ def _translate_to_cog(src: str, dest_tif: Path) -> Path:
         raise RuntimeError("GDAL COG driver not available; upgrade GDAL (>= 3.1).")
 
     gdal.Translate(
-        str(dest_tif), src, format="COG",
+        str(dest_tif),
+        src,
+        format="COG",
         creationOptions=[
             # tiling + compression
-            "BLOCKSIZE=512",          # forces tiling
+            "BLOCKSIZE=512",  # forces tiling
             "COMPRESS=LZW",
             "LEVEL=9",
             "BIGTIFF=IF_SAFER",
@@ -177,11 +237,10 @@ def _translate_to_cog(src: str, dest_tif: Path) -> Path:
             "OVERVIEWS=AUTO",
             "SPARSE_OK=YES",
             # perf
-            "NUM_THREADS=ALL_CPUS"
-        ]
+            "NUM_THREADS=ALL_CPUS",
+        ],
     )
     return dest_tif
-
 
 
 def _expand_input_to_cogs(entry: Union[str, Path], asset_dir: Path) -> List[Path]:
@@ -194,7 +253,7 @@ def _expand_input_to_cogs(entry: Union[str, Path], asset_dir: Path) -> List[Path
     - other existing files -> copy as-is (but these will fail later if not raster)
     """
 
-        # If it's a plain string path (not a GDAL SDS string), treat it as a Path
+    # If it's a plain string path (not a GDAL SDS string), treat it as a Path
     if isinstance(entry, str) and not _is_subdataset_string(entry):
         entry = Path(entry)
 
@@ -263,7 +322,9 @@ def _expand_input_to_cogs(entry: Union[str, Path], asset_dir: Path) -> List[Path
     raise RuntimeError(f"Unsupported input: {entry}")
 
 
-def _write_thumbnail_from_raster(src_path: Path, thumb_path: Path, size: int = 255) -> Path:
+def _write_thumbnail_from_raster(
+    src_path: Path, thumb_path: Path, size: int = 255
+) -> Path:
     """Create a small JPEG quicklook from the first raster asset."""
     with rasterio.open(src_path) as src:
         data = src.read()  # shape: (bands, height, width)
@@ -285,7 +346,7 @@ def _write_thumbnail_from_raster(src_path: Path, thumb_path: Path, size: int = 2
     for band in data:
         b = band.astype("float32")
         if nodata is not None:
-            mask = (b == nodata)
+            mask = b == nodata
         else:
             mask = np.zeros_like(b, dtype=bool)
 
@@ -297,7 +358,9 @@ def _write_thumbnail_from_raster(src_path: Path, thumb_path: Path, size: int = 2
             vmax = np.percentile(valid, 98)
             if vmax <= vmin:
                 vmax = vmin + 1.0
-            scaled = ((np.clip(b, vmin, vmax) - vmin) / (vmax - vmin) * 255.0).astype("uint8")
+            scaled = ((np.clip(b, vmin, vmax) - vmin) / (vmax - vmin) * 255.0).astype(
+                "uint8"
+            )
             scaled[mask] = 0
         out.append(scaled)
 
@@ -307,6 +370,7 @@ def _write_thumbnail_from_raster(src_path: Path, thumb_path: Path, size: int = 2
     thumb_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(thumb_path, format="JPEG", quality=85, optimize=True)
     return thumb_path
+
 
 def _apply_georef_via_vrt(src_tif: Path, ref_transform, ref_crs) -> Path:
     """
@@ -326,10 +390,16 @@ def _apply_georef_via_vrt(src_tif: Path, ref_transform, ref_crs) -> Path:
     vrt_ds = drv_vrt.CreateCopy(str(vrt_path), ds, strict=0)
 
     # Set GeoTransform (Affine: a,b,c; d,e,f) -> (c,a,b; f,d,e)
-    vrt_ds.SetGeoTransform((
-        ref_transform.c, ref_transform.a, ref_transform.b,
-        ref_transform.f, ref_transform.d, ref_transform.e
-    ))
+    vrt_ds.SetGeoTransform(
+        (
+            ref_transform.c,
+            ref_transform.a,
+            ref_transform.b,
+            ref_transform.f,
+            ref_transform.d,
+            ref_transform.e,
+        )
+    )
     srs = osr.SpatialReference()
     srs.ImportFromWkt(ref_crs.to_wkt())
     vrt_ds.SetProjection(srs.ExportToWkt())
@@ -339,12 +409,18 @@ def _apply_georef_via_vrt(src_tif: Path, ref_transform, ref_crs) -> Path:
     # VRT -> fresh COG
     tmp_cog = src_tif.with_suffix(".tmp.cog.tif")
     gdal.Translate(
-        str(tmp_cog), str(vrt_path), format="COG",
+        str(tmp_cog),
+        str(vrt_path),
+        format="COG",
         creationOptions=[
-            "COMPRESS=LZW","LEVEL=9","BLOCKSIZE=512",
-            "OVERVIEWS=AUTO","SPARSE_OK=YES","BIGTIFF=IF_SAFER",
-            "NUM_THREADS=ALL_CPUS"
-        ]
+            "COMPRESS=LZW",
+            "LEVEL=9",
+            "BLOCKSIZE=512",
+            "OVERVIEWS=AUTO",
+            "SPARSE_OK=YES",
+            "BIGTIFF=IF_SAFER",
+            "NUM_THREADS=ALL_CPUS",
+        ],
     )
     os.remove(vrt_path)
     shutil.move(tmp_cog, src_tif)
@@ -358,8 +434,22 @@ def create_stac_structure(
     item_id: str,
     asset_name: str | None = None,
 ) -> Tuple[pystac.Collection, pystac.Item]:
+
+    print(f"--> [create_stac_structure] Creating structure from item_id={item_id}")
+
     """Create a STAC collection and item for the provided data."""
     out_dir = Path(output_dir)
+
+    print(f"--> [create_stac_structure] matching regex against item_id={item_id}")
+    m = _ADHOC_RE.match(item_id)
+    try:
+        svc, ts, ctr = m.group("svc", "ts", "ctr")
+        ictr = int(ctr)
+        tstmp = parse_hub_ts(ts)
+    except:
+        svc, ts = m.group("svc", "ts")
+        ictr = 1
+        tstmp = parse_hub_ts(ts)
 
     collection_info = COLLECTIONS.get(collection_id)
     if collection_info is None:
@@ -425,7 +515,11 @@ def create_stac_structure(
 
             # --- If missing georef, inherit from first good one (same size) via VRT -> fresh COG (no in-place edit) ---
             if not (has_crs and has_transform):
-                if ref_transform is not None and ref_crs is not None and ref_size is not None:
+                if (
+                    ref_transform is not None
+                    and ref_crs is not None
+                    and ref_size is not None
+                ):
                     if (width, height) == ref_size:
                         _apply_georef_via_vrt(dest, ref_transform, ref_crs)
                         # refresh metadata after rewrite
@@ -457,19 +551,23 @@ def create_stac_structure(
             epsg_code = current_crs.to_epsg() if current_crs else None
             if epsg_code != target_epsg:
                 if gdal is None:
-                    raise RuntimeError("gdal is required to reproject data to EPSG:2100")
-            
+                    raise RuntimeError(
+                        "gdal is required to reproject data to EPSG:2100"
+                    )
+
                 # 1) Warp -> VRT (cheap, no tiling yet)
                 tmp_vrt = dest.with_suffix(".tmp.vrt")
                 gdal.Warp(
-                    str(tmp_vrt), str(dest), format="VRT",
+                    str(tmp_vrt),
+                    str(dest),
+                    format="VRT",
                     options=gdal.WarpOptions(
                         dstSRS=f"EPSG:{target_epsg}",
                         multithread=True,
-                        resampleAlg="bilinear"
-                    )
+                        resampleAlg="bilinear",
+                    ),
                 )
-            
+
                 # 2) VRT -> COG with tiling + overviews
                 tmp_cog = dest.with_suffix(".tmp.tif")
                 _translate_to_cog(str(tmp_vrt), tmp_cog)
@@ -484,7 +582,6 @@ def create_stac_structure(
                     has_crs = bool(src2.crs)
                     has_transform = not src2.transform.is_identity
 
-
                 # If we just reprojected and reference wasn't set yet, refresh reference from reprojected file
                 if ref_size is None:
                     with rasterio.open(dest) as src2:
@@ -496,14 +593,24 @@ def create_stac_structure(
 
             with rasterio.open(dest) as src:
                 # Transform asset bounds (likely in EPSG:2100) to EPSG:4326 for STAC
-                left, bottom, right, top = transform_bounds(src.crs, "EPSG:4326",
-                                                            src.bounds.left, src.bounds.bottom,
-                                                            src.bounds.right, src.bounds.top,
-                                                            densify_pts=21)
+                left, bottom, right, top = transform_bounds(
+                    src.crs,
+                    "EPSG:4326",
+                    src.bounds.left,
+                    src.bounds.bottom,
+                    src.bounds.right,
+                    src.bounds.top,
+                    densify_pts=21,
+                )
 
             wgs84_bounds = (left, bottom, right, top)
             if bbox is None:
-                bbox = [wgs84_bounds[0], wgs84_bounds[1], wgs84_bounds[2], wgs84_bounds[3]]
+                bbox = [
+                    wgs84_bounds[0],
+                    wgs84_bounds[1],
+                    wgs84_bounds[2],
+                    wgs84_bounds[3],
+                ]
             else:
                 bbox = [
                     min(bbox[0], wgs84_bounds[0]),
@@ -512,28 +619,52 @@ def create_stac_structure(
                     max(bbox[3], wgs84_bounds[3]),
                 ]
 
-
     if bbox is None:
         raise ValueError("No input data provided")
 
     geometry = {
         "type": "Polygon",
-        "coordinates": [[
-            [bbox[0], bbox[1]],
-            [bbox[0], bbox[3]],
-            [bbox[2], bbox[3]],
-            [bbox[2], bbox[1]],
-            [bbox[0], bbox[1]],
-        ]],
+        "coordinates": [
+            [
+                [bbox[0], bbox[1]],
+                [bbox[0], bbox[3]],
+                [bbox[2], bbox[3]],
+                [bbox[2], bbox[1]],
+                [bbox[0], bbox[1]],
+            ]
+        ],
     }
+
+    product_label = "SBAS (Distributed Scatterers) displacement maps for Greece"
+    area_name = "Greece"
+    title = f"{product_label} - {area_name} - {tstmp.strftime('%Y-%m-%dT%H:%M:%SZ')}"
 
     item = pystac.Item(
         id=item_id,
         geometry=geometry,
         bbox=bbox,
-        datetime=datetime.utcnow(),
-        properties={},
+        datetime=tstmp,
+        properties={
+            "processing:datetime": tstmp.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "processing:facility": PROCESSING_FACILITY,
+            "processing:version": PROCESSING_VERSION,
+            "processing:software": {
+                PROCESSING_SOFTWARE_NAME: PROCESSING_VERSION,
+                "repo": PROCESSING_SOFTWARE_REPO,
+            },
+            "processing:level": PROCESSING_LEVEL,
+            "title": title,
+        },
     )
+
+    # proj:centroid (used by CentroidValidator)
+    item.properties["proj:centroid"] = {
+        "lat": (bbox[1] + bbox[3]) / 2.0,
+        "lon": (bbox[0] + bbox[2]) / 2.0,
+    }
+
+    # item title -> DOES NOT WORK
+    item.title = GEO_VELOCITY_TITLE(tstmp)
 
     # Projection info from the first asset
     if gdal is None:
@@ -545,9 +676,9 @@ def create_stac_structure(
         if wkt:
             srs.ImportFromWkt(wkt)
             epsg = srs.GetAttrValue("AUTHORITY", 1)
-            proj_ext = "https://stac-extensions.github.io/projection/v1.0.0/schema.json"
-            if proj_ext not in item.stac_extensions:
-                item.stac_extensions.append(proj_ext)
+            for ext in (PROJ_EXT, RASTER_EXT, PROCESSING_EXT):
+                if ext not in item.stac_extensions:
+                    item.stac_extensions.append(ext)
             item.properties["proj:wkt2"] = srs.ExportToWkt()
             if epsg:
                 try:
@@ -556,9 +687,11 @@ def create_stac_structure(
                     item.properties["proj:epsg"] = epsg
 
     # --- INSERT THUMBNAIL CREATION HERE ---
-    first_raster = next((p for p in asset_paths if p.suffix.lower() in {".tif", ".tiff"}), None)
+    first_raster = next(
+        (p for p in asset_paths if p.suffix.lower() in {".tif", ".tiff"}), None
+    )
     if first_raster is not None:
-        thumb_path = (out_dir / "assets" / collection_id / item_id / "thumbnail.jpg")
+        thumb_path = out_dir / "assets" / collection_id / item_id / "thumbnail.jpg"
         _write_thumbnail_from_raster(first_raster, thumb_path, size=255)
 
         rel_thumb = Path(os.path.relpath(thumb_path, start=out_dir)).as_posix()
@@ -571,12 +704,14 @@ def create_stac_structure(
             ),
         )
         # Optional preview link
-        item.add_link(pystac.Link(
-            rel="preview",
-            target=rel_thumb,
-            media_type=pystac.MediaType.JPEG,
-            title="Thumbnail preview"
-        ))    
+        item.add_link(
+            pystac.Link(
+                rel="preview",
+                target=rel_thumb,
+                media_type=pystac.MediaType.JPEG,
+                title="Thumbnail preview",
+            )
+        )
 
     # Add assets
     for path in asset_paths:
@@ -587,11 +722,71 @@ def create_stac_structure(
             media_type = pystac.MediaType.GEOTIFF
         elif suffix in {".nc", ".netcdf"}:
             media_type = "application/x-netcdf"
+
         key = asset_name if asset_name and len(asset_paths) == 1 else path.stem
-        item.add_asset(
-            key,
-            pystac.Asset(href=str(rel_href), media_type=media_type, roles=["data"]),
-        )
+
+        # Base object asset
+        asset = pystac.Asset(href=rel_href, media_type=media_type, roles=["data"])
+
+        # 1) Asset title / name (you already added something like this;
+        # processing_dt_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        # product_label = COLLECTIONS["LS-DF"]["items"].get("LS-DF-SB-S1", "LS-DF-SB-S1")
+        # area_name = "Greece"
+        # asset_title = f"{product_label} – {area_name} – {processing_dt_str}"
+        asset.extra_fields["title"] = GEO_VELOCITY_TITLE(tstmp)
+        asset.extra_fields["description"] = GEO_VELOCITY_TITLE(tstmp)
+        asset.extra_fields["name"] = GEO_VELOCITY_TITLE(tstmp)
+
+        # 2) product:id in the new format:
+        #    <Item_UID>_(RAS-CLA|RAS-CNT|VEC-PNT|VEC-LIN|VEC-POL|NON-GEO)_<NNNN>
+        # with Item_UID = <ServiceUID>_<YYYYMMDDTHHMMSSdmmm>
+        item_uid = _item_uid_from_id(item.id)
+        if suffix in {".tif", ".tiff"} and key != "thumbnail":
+            asset_code = "RAS-CNT"  # continuous raster
+        else:
+            asset_code = "NON-GEO"  # safe fallback for non-rasters
+        product_id = f"{svc}_{ts}_{asset_code}_{ictr:04d}"
+        asset.extra_fields["product:id"] = product_id
+
+        if suffix in {".tif", ".tiff"} and key != "thumbnail":
+            with rasterio.open(path) as src:
+                transform = src.transform
+                width = src.width
+                height = src.height
+                bounds = src.bounds
+                dtype = src.dtypes[0]
+                xres = abs(src.transform.a)
+                yres = abs(src.transform.e)
+                spatial_res = float((xres + yres) / 2.0)
+
+                # proj:* at asset level
+                asset.extra_fields["proj:shape"] = [height, width]
+                asset.extra_fields["proj:bbox"] = [
+                    bounds.left,
+                    bounds.bottom,
+                    bounds.right,
+                    bounds.top,
+                ]
+                asset.extra_fields["proj:transform"] = [
+                    transform.a,
+                    transform.b,
+                    transform.c,
+                    transform.d,
+                    transform.e,
+                    transform.f,
+                ]
+                asset_bands = [
+                    {
+                        "data_type": dtype,
+                        "sampling": "area",  # per spec
+                        "spatial_resolution": spatial_res,
+                    }
+                ]
+                asset.extra_fields["raster:bands"] = asset_bands
+                # Everything should be in EPSG:2100 by this point
+                asset.extra_fields["proj:code"] = "EPSG:2100"
+
+        item.add_asset(key, asset)
 
     collection = pystac.Collection(
         id=collection_id,
@@ -620,6 +815,9 @@ def create_stac_structure(
         ).as_posix()
 
     item_dict = item.to_dict()
+    # Make absolutely sure the title is there
+    if not item_dict.get("title"):
+        item_dict["title"] = title
     for link in item_dict.get("links", []):
         link["href"] = Path(os.path.relpath(link["href"], start=items_dir)).as_posix()
 

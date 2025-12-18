@@ -17,15 +17,12 @@ import os
 
 # PDF spec — On-Demand / Ad-Hoc:
 # <Service_UID>_<YYYYMMDDTHHMMSSmmm>_<NNNNNN>
-ADHOC_RE = re.compile(
-    r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}\d{3})_(?P<ctr>\d{6})$"
-)
+ADHOC_RE = re.compile(r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}\d{3})_(?P<ctr>\d{6})$")
 
 # PDF spec — Systematic:
 # <Service_UID>_<YYYYMMDD>   (other frequencies exist, but day-level is the base)
-SYSTEMATIC_DAY_RE = re.compile(
-    r"^(?P<svc>[A-Z0-9\-]+)_(?P<date>\d{8})$"
-)
+SYSTEMATIC_DAY_RE = re.compile(r"^(?P<svc>[A-Z0-9\-]+)_(?P<date>\d{8})$")
+
 
 def _id_ok_for_ls_df(item_id: str) -> bool:
     """
@@ -41,14 +38,39 @@ def _id_ok_for_ls_df(item_id: str) -> bool:
     if m and m.group("svc").startswith("LS-DF"):
         return True
     return False
-ID_COUNTER_PATTERN = re.compile(r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}\d{3})_(?P<ctr>\d{6})$")
 
-def utc_timestamp_millis() -> str:
+
+ID_COUNTER_PATTERN = re.compile(
+    r"^(?P<svc>[A-Z0-9\-]+)_(?P<ts>\d{8}T\d{6}\d{3})_(?P<ctr>\d{6})$"
+)
+
+
+def utc_timestamp_millis_version03() -> str:
     """Return UTC timestamp as YYYYMMDDTHHMMSSmmm."""
     now = datetime.now(timezone.utc)
     # microseconds -> milliseconds (3 digits)
     mmm = f"{now.microsecond // 1000:03d}"
     return now.strftime("%Y%m%dT%H%M%S") + mmm
+
+
+def utc_timestamp_millis(dt: datetime | None = None) -> str:
+    """
+    Return UTC timestamp in the *validator* format:
+
+        YYYYMMDDTHHMMSSdmmm
+
+    where:
+      - YYYYMMDDTHHMMSS is UTC time
+      - 'd' is a literal character
+      - mmm are milliseconds (000–999)
+    """
+    now = dt or datetime.utcnow()
+    ts_prefix = now.strftime("%Y%m%dT%H%M%S")  # YYYYMMDDTHHMMSS
+    millis = int(now.microsecond / 1000)  # 0–999
+
+    # IMPORTANT: literal 'd' between seconds and millis
+    return f"{ts_prefix}d{millis:03d}"
+
 
 def next_counter_for_service(output_dir: str, service_uid: str) -> int:
     """
@@ -86,6 +108,7 @@ def next_counter_for_service(output_dir: str, service_uid: str) -> int:
                 except ValueError:
                     pass
     return max_ctr + 1
+
 
 def format_counter(n: int) -> str:
     return f"{n:06d}"
@@ -130,11 +153,18 @@ def main() -> None:
         if not args.service_uid:
             raise SystemExit("--service-uid is required when using --auto-item-id")
         ts = utc_timestamp_millis()
-        ctr = format_counter(next_counter_for_service(args.output_dir, args.service_uid))
-        auto_item_id = f"{args.service_uid}_{ts}_{ctr}"  # <Service_UID>_<YYYYMMDDTHHMMSSmmm>_<NNNNNN>
+        ctr = format_counter(
+            next_counter_for_service(args.output_dir, args.service_uid)
+        )
+        # auto_item_id = f"{args.service_uid}_{ts}_{ctr}"  # <Service_UID>_<YYYYMMDDTHHMMSSmmm>_<NNNNNN>
+        auto_item_id = f"{args.service_uid}_{ts}"  # <Service_UID>_<YYYYMMDDTHHMMSSmmm>
         item_id = auto_item_id
     else:
         item_id = args.item_id
+    print(
+        f"--> [stac_products] Creating item with service_uid={args.service_uid}, timestamp={ts} and ctr={ctr}"
+    )
+    print(f"--> [stac_products] Creating item_id={item_id}")
 
     # Support both comma-separated and space-separated inputs
     image_paths: list[str] = []
@@ -148,7 +178,6 @@ def main() -> None:
         output_dir=args.output_dir,
         collection_id=args.collection_id,
         item_id=item_id,
-
     )
 
     assets_path = Path(args.output_dir) / "assets"
